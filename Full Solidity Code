@@ -1,0 +1,341 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.13;
+
+import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@lukso/lsp-smart-contracts/contracts/LSP4DigitalAssetMetadata/LSP4DigitalAssetMetadata.sol";
+import "@lukso/lsp-smart-contracts/contracts/LSP4DigitalAssetMetadata/LSP4DigitalAssetMetadataInitAbstract.sol";
+import "@lukso/lsp-smart-contracts/contracts/LSP6KeyManager/ILSP6KeyManager.sol";
+import "@lukso/lsp-smart-contracts/contracts/LSP1UniversalReceiver/ILSP1UniversalReceiver.sol";
+
+
+// This interface is assumed to be defined elsewhere in the project.
+// It defines the events for the LSP27 standard.
+interface ILSP27 {
+    event BadgeAwarded(bytes32 indexed badgeId, address indexed recipient, address indexed creator);
+    event BadgeReturned(bytes32 indexed badgeId, address indexed holder);
+    event BadgeProposed(bytes32 indexed badgeId, address indexed recipient, address indexed proposer);
+    event BadgeClaimed(bytes32 indexed badgeId, address indexed claimer);
+}
+
+
+/**
+ * @title LSP27AchievementBadge - Core with User Consent
+ * @dev Core implementation including both direct award and a propose/claim mechanism for user consent.
+ * Extensions can be added via inheritance or composition.
+ */
+contract LSP27AchievementBadge is ILSP27, LSP4DigitalAssetMetadata {
+    
+    // Core state - minimal footprint
+    mapping(address => mapping(bytes32 => bool)) public badgeHolders;
+    mapping(bytes32 => address) public badgeCreators;
+    mapping(address => mapping(bytes32 => address)) public proposedBadges; // recipient -> badgeId -> proposer
+    
+    // ERC725Y key for off-chain indexing of a recipient's badges
+    bytes32 internal constant _LSP27_BADGES_KEY = keccak256("LSP27Badges");
+    
+    // Simple access control - can be overridden
+    modifier onlyCreator() virtual {
+        require(msg.sender == owner(), "LSP27: Not authorized");
+        _;
+    }
+    
+    constructor(
+        string memory name,
+        string memory symbol,
+        address owner
+    ) LSP4DigitalAssetMetadata(name, symbol, owner) {}
+    
+    /**
+     * @dev Award badge directly. Use this when consent is implied or handled off-chain.
+     */
+    function awardBadge(address recipient, bytes32 badgeId) 
+        external 
+        virtual 
+        onlyCreator 
+    {
+        require(recipient != address(0), "LSP27: Zero address");
+        require(!badgeHolders[recipient][badgeId], "LSP27: Already awarded");
+        
+        // Core state update
+        badgeHolders[recipient][badgeId] = true;
+        
+        // Track creator on first award
+        if (badgeCreators[badgeId] == address(0)) {
+            badgeCreators[badgeId] = msg.sender;
+        }
+        
+        // Emit event
+        emit BadgeAwarded(badgeId, recipient, msg.sender);
+        
+        // Hook for extensions
+        _afterBadgeAwarded(recipient, badgeId);
+    }
+
+    /**
+     * @dev Propose a badge to a recipient, who must then claim it to receive it.
+     */
+    function proposeBadge(address recipient, bytes32 badgeId) 
+        external 
+        virtual
+        onlyCreator 
+    {
+        require(!badgeHolders[recipient][badgeId], "LSP27: Already holds badge");
+        proposedBadges[recipient][badgeId] = msg.sender;
+        emit BadgeProposed(badgeId, recipient, msg.sender);
+    }
+    
+    /**
+     * @dev Allows a user to claim a badge that has been proposed to them.
+     */
+    function claimBadge(bytes32 badgeId) external virtual {
+        address proposer = proposedBadges[msg.sender][badgeId];
+        require(proposer != address(0), "LSP27: Not proposed");
+        
+        delete proposedBadges[msg.sender][badgeId];
+        
+        badgeHolders[msg.sender][badgeId] = true;
+        if (badgeCreators[badgeId] == address(0)) {
+            badgeCreators[badgeId] = proposer; // Correctly attribute creator to the proposer
+        }
+        
+        emit BadgeClaimed(badgeId, msg.sender);
+        _afterBadgeAwarded(msg.sender, badgeId);
+    }
+
+    /**
+     * @dev Check if a badge has been proposed to a recipient.
+     */
+    function isBadgeProposed(address recipient, bytes32 badgeId) 
+        external 
+        view 
+        returns (bool) 
+    {
+        return proposedBadges[recipient][badgeId] != address(0);
+    }
+    
+    /**
+     * @dev Return badge to creator.
+     */
+    function returnBadge(bytes32 badgeId) external virtual {
+        require(badgeHolders[msg.sender][badgeId], "LSP27: Not holder");
+        
+        badgeHolders[msg.sender][badgeId] = false;
+        emit BadgeReturned(badgeId, msg.sender);
+        
+        // Hook for extensions
+        _afterBadgeReturned(msg.sender, badgeId);
+    }
+    
+    /**
+     * @dev Check if address holds badge.
+     */
+    function hasBadge(address holder, bytes32 badgeId) 
+        external 
+        view 
+        returns (bool) 
+    {
+        return badgeHolders[holder][badgeId];
+    }
+    
+    /**
+     * @dev Extension hook - override for custom logic
+     */
+    function _afterBadgeAwarded(address recipient, bytes32 badgeId) 
+        internal 
+        virtual 
+    {}
+    
+    /**
+     * @dev Extension hook - override for custom logic  
+     */
+    function _afterBadgeReturned(address holder, bytes32 badgeId) 
+        internal 
+        virtual 
+    {}
+    
+    /**
+     * @dev Interface support
+     */
+    function supportsInterface(bytes4 interfaceId) 
+        public 
+        view 
+        virtual 
+        override 
+        returns (bool) 
+    {
+        return interfaceId == type(ILSP27).interfaceId ||
+               super.supportsInterface(interfaceId);
+    }
+}
+
+// ============================================================================
+// EXTENSIONS - Optional Complexity Modules
+// ============================================================================
+
+/**
+ * @title LSP27WithBadgeMetadata - Adds metadata for each badgeId
+ */
+abstract contract LSP27WithBadgeMetadata is LSP27AchievementBadge {
+
+    bytes32 internal constant _LSP27_BADGE_METADATA_KEY_PREFIX = keccak256("LSP27BadgeMetadata");
+
+    /**
+     * @dev Sets the LSP4 metadata URI for a specific badgeId.
+     * @param badgeId The unique identifier for the badge type.
+     * @param metadata The encoded metadata URI (e.g., ipfs://... or https://...).
+     */
+    function setBadgeMetadata(bytes32 badgeId, bytes memory metadata) external virtual onlyCreator {
+        bytes32 metadataKey = keccak256(abi.encodePacked(_LSP27_BADGE_METADATA_KEY_PREFIX, badgeId));
+        _setData(metadataKey, metadata);
+    }
+}
+
+/**
+ * @title LSP27WithArrayTracking - Adds efficient badge enumeration for recipients
+ */
+abstract contract LSP27WithArrayTracking is LSP27AchievementBadge {
+    
+    mapping(address => bytes32[]) private recipientBadges;
+    mapping(address => mapping(bytes32 => uint256)) private badgeIndex;
+    
+    function _afterBadgeAwarded(address recipient, bytes32 badgeId) 
+        internal 
+        virtual 
+        override 
+    {
+        recipientBadges[recipient].push(badgeId);
+        badgeIndex[recipient][badgeId] = recipientBadges[recipient].length - 1;
+        
+        // Update ERC725Y storage with the list of recipient's badges
+        bytes32 key = keccak256(abi.encodePacked(_LSP27_BADGES_KEY, recipient));
+        _setData(key, abi.encode(recipientBadges[recipient]));
+        
+        super._afterBadgeAwarded(recipient, badgeId);
+    }
+    
+    function _afterBadgeReturned(address holder, bytes32 badgeId) 
+        internal 
+        virtual 
+        override 
+    {
+        // Swap and pop for gas efficiency
+        uint256 indexToRemove = badgeIndex[holder][badgeId];
+        bytes32[] storage badges = recipientBadges[holder];
+        uint256 lastIndex = badges.length - 1;
+        
+        if (indexToRemove != lastIndex) {
+            bytes32 lastBadgeId = badges[lastIndex];
+            badges[indexToRemove] = lastBadgeId;
+            badgeIndex[holder][lastBadgeId] = indexToRemove;
+        }
+        
+        badges.pop();
+        delete badgeIndex[holder][badgeId];
+        
+        // Update ERC725Y storage
+        bytes32 key = keccak256(abi.encodePacked(_LSP27_BADGES_KEY, holder));
+        _setData(key, abi.encode(badges));
+        
+        super._afterBadgeReturned(holder, badgeId);
+    }
+    
+    function getBadgesByRecipient(address recipient) 
+        external 
+        view 
+        returns (bytes32[] memory) 
+    {
+        return recipientBadges[recipient];
+    }
+}
+
+/**
+ * @title LSP27WithLSP6Permissions - Adds LSP-6 permission system
+ */
+abstract contract LSP27WithLSP6Permissions is LSP27AchievementBadge {
+    
+    bytes32 public constant PERMISSION_AWARD_BADGE = keccak256("AWARD_BADGE");
+    
+    modifier onlyCreator() virtual override {
+        address contractOwner = owner();
+        
+        if (contractOwner.code.length > 0) {
+            try ILSP6KeyManager(contractOwner).hasPermission(msg.sender, PERMISSION_AWARD_BADGE) 
+            returns (bool hasPermission) {
+                require(hasPermission, "LSP27: No permission");
+            } catch {
+                require(msg.sender == contractOwner, "LSP27: Not owner");
+            }
+        } else {
+            require(msg.sender == contractOwner, "LSP27: Not owner");
+        }
+        _;
+    }
+}
+
+/**
+ * @title LSP27WithLSP1Notifications - Adds Universal Receiver notifications
+ */
+abstract contract LSP27WithLSP1Notifications is LSP27AchievementBadge {
+    
+    bytes32 private constant _TYPEID_LSP27_BADGE_AWARDED = keccak256("LSP27BadgeAwarded");
+    
+    function _afterBadgeAwarded(address recipient, bytes32 badgeId) 
+        internal 
+        virtual 
+        override 
+    {
+        if (recipient.code.length > 0) {
+            try ILSP1UniversalReceiver(recipient).universalReceiver(
+                _TYPEID_LSP27_BADGE_AWARDED,
+                abi.encode(badgeId, msg.sender)
+            ) {} catch {}
+        }
+        
+        super._afterBadgeAwarded(recipient, badgeId);
+    }
+}
+
+// ============================================================================
+// PRESET COMBINATIONS - Common Use Cases
+// ============================================================================
+
+/**
+ * @title LSP27Standard - Standard feature set
+ */
+contract LSP27Standard is 
+    LSP27WithBadgeMetadata,
+    LSP27WithArrayTracking,
+    LSP27WithLSP1Notifications 
+{
+    constructor(
+        string memory name,
+        string memory symbol,
+        address owner
+    ) LSP27AchievementBadge(name, symbol, owner) {}
+}
+
+/**
+ * @title LSP27Advanced - Full feature set with upgradability
+ */
+contract LSP27Advanced is 
+    LSP4DigitalAssetMetadataInitAbstract,
+    LSP27WithBadgeMetadata,
+    LSP27WithArrayTracking,
+    LSP27WithLSP6Permissions,
+    LSP27WithLSP1Notifications,
+    ReentrancyGuardUpgradeable,
+    UUPSUpgradeable 
+{
+    function initialize(
+        string memory name,
+        string memory symbol,
+        address newOwner
+    ) public initializer {
+        __LSP4DigitalAssetMetadata_init(name, symbol, newOwner);
+        __ReentrancyGuard_init();
+        __UUPSUpgradeable_init();
+    }
+    
+    function _authorizeUpgrade(address) internal override onlyOwner {}
+}
